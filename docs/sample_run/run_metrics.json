@@ -1,0 +1,48 @@
+{
+  "pipeline": "delivery-pipeline",
+  "run_date": "2026-11-01",
+  "stage_seconds": {
+    "generate": 44.9,
+    "ingest": 0.0,
+    "extract": 6.51,
+    "transform": 2.24,
+    "data_quality": 38.94,
+    "load_processed": 6.69,
+    "build_curated": 23.2,
+    "load_warehouse": 1.57,
+    "kpis": 0.4
+  },
+  "total_seconds": 124.45,
+  "injected_issues": {
+    "status_case_whitespace": 22181,
+    "station_code_lowercase": 33272,
+    "event_ts_ddmmyyyy": 22181,
+    "event_ts_epoch_millis": 11090,
+    "event_ts_invalid": 2772,
+    "package_id_missing": 2218,
+    "weight_out_of_range": 2218,
+    "dsp_code_unknown": 1663,
+    "attempt_number_out_of_range": 1663,
+    "delivered_with_failure_reason": 1663,
+    "exact_duplicates": 11090
+  },
+  "raw_records": 1120188,
+  "valid_records": 1096574,
+  "quarantined_records": 12528,
+  "duplicates_removed": 11086,
+  "dq_pass_rate_pct": 98.87,
+  "curated_row_counts": {
+    "dim_dsp": 10,
+    "dim_station": 8,
+    "dim_driver": 263,
+    "dim_date": 32,
+    "fact_delivery_attempt": 1096574
+  },
+  "warehouse_row_counts": {
+    "dim_date": 32,
+    "dim_dsp": 10,
+    "dim_station": 8,
+    "dim_driver": 263,
+    "fact_delivery_attempt": 1096574
+  }
+}

@@ -1,0 +1,390 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Last-mile delivery analytics: encrypted S3 data lake, S3-triggered ingestion Lambda,
+  Kinesis Data Firehose stream, AWS Glue (PySpark) ETL with data-quality gate,
+  Amazon Redshift Serverless warehouse, least-privilege IAM and CloudWatch alerting.
+
+Parameters:
+  ArtifactsBucket:
+    Type: String
+    Description: Existing bucket holding the Lambda zip, Glue script and Python package (created by deploy_aws.sh).
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional e-mail for pipeline failure and data-quality alerts.
+  MinDqPassRate:
+    Type: String
+    Default: "0.95"
+  RedshiftBaseCapacity:
+    Type: Number
+    Default: 8
+    MinValue: 8
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- data lake
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: IngestLambdaInvokePermission
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-datalake-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawAfter90Days
+            Status: Enabled
+            Prefix: raw/
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt IngestLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: landing/
+
+  DataLakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataLakeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DataLakeBucket.Arn
+              - !Sub "${DataLakeBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  PiiSaltSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Salt for pseudonymising driver identifiers.
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # ---------------------------------------------------------------- ingestion Lambda
+  IngestLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ingest-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-datalake-${AWS::AccountId}/landing/*"
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource:
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-datalake-${AWS::AccountId}/raw/*"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-datalake-${AWS::AccountId}/quarantine/*"
+              - Effect: Allow
+                Action: [glue:StartJobRun]
+                Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${EtlJob}"
+
+  IngestLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Validates files landing in S3, moves them to raw/ or quarantine/, starts the Glue ETL.
+      Runtime: python3.12
+      Handler: delivery_pipeline.aws.lambda_ingest.handler
+      Role: !GetAtt IngestLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: lambda/ingest.zip
+      Environment:
+        Variables:
+          GLUE_JOB_NAME: !Ref EtlJob
+
+  IngestLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngestLambda
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-datalake-${AWS::AccountId}"
+
+  # ---------------------------------------------------------------- streaming ingestion
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: firehose.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: firehose-to-raw
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload, s3:GetBucketLocation, s3:ListBucket,
+                         s3:ListBucketMultipartUploads]
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub "${DataLakeBucket.Arn}/raw/stream/*"
+                  - !Sub "${DataLakeBucket.Arn}/quarantine/firehose_errors/*"
+
+  DeliveryEventStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: "raw/stream/ingest_date=!{timestamp:yyyy-MM-dd}/"
+        ErrorOutputPrefix: "quarantine/firehose_errors/!{firehose:error-output-type}/!{timestamp:yyyy-MM-dd}/"
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 64
+        CompressionFormat: UNCOMPRESSED
+
+  # ---------------------------------------------------------------- Glue ETL
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: etl-data-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-datalake-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-datalake-${AWS::AccountId}"
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::${ArtifactsBucket}/glue/*"
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref PiiSaltSecret
+              - Effect: Allow
+                Action: [cloudwatch:PutMetricData]
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: DeliveryPipeline
+
+  EtlJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Description: PySpark ETL - clean, mask PII, data-quality gate, star schema.
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 60
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactsBucket}/glue/glue_etl_job.py"
+      DefaultArguments:
+        "--extra-py-files": !Sub "s3://${ArtifactsBucket}/glue/delivery_pipeline.zip"
+        "--lake_root": !Sub "s3://${AWS::StackName}-datalake-${AWS::AccountId}"
+        "--run_date": "auto"
+        "--min_dq_pass_rate": !Ref MinDqPassRate
+        "--pii_salt_secret": !Ref PiiSaltSecret
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-language": python
+
+  HourlyEtlTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Description: Hourly micro-batch for Firehose stream data.
+      Type: SCHEDULED
+      Schedule: cron(5 * * * ? *)
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref EtlJob
+
+  # ---------------------------------------------------------------- Redshift Serverless
+  RedshiftAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Redshift Serverless admin credentials.
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "deliveryadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: "\"'@/\\ "
+
+  RedshiftCopyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: redshift.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-curated-zone
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "${DataLakeBucket.Arn}/curated/*"
+              - Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !GetAtt DataLakeBucket.Arn
+
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub "${AWS::StackName}-ns"
+      DbName: delivery
+      AdminUsername: deliveryadmin
+      AdminUserPassword: !Sub "{{resolve:secretsmanager:${RedshiftAdminSecret}:SecretString:password}}"
+      IamRoles:
+        - !GetAtt RedshiftCopyRole.Arn
+      DefaultIamRoleArn: !GetAtt RedshiftCopyRole.Arn
+
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Sub "${AWS::StackName}-wg"
+      NamespaceName: !Ref RedshiftNamespace
+      BaseCapacity: !Ref RedshiftBaseCapacity
+      PubliclyAccessible: false
+
+  # ---------------------------------------------------------------- monitoring
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      # Not encrypted with alias/aws/sns on purpose: EventBridge and CloudWatch alarms cannot
+      # publish to topics using the AWS-managed key. Alerts carry no sensitive data.
+      Subscription: !If
+        - HasAlertEmail
+        - - Endpoint: !Ref AlertEmail
+            Protocol: email
+        - !Ref AWS::NoValue
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [events.amazonaws.com, cloudwatch.amazonaws.com] }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
+  GlueJobFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Alert when the ETL job fails, times out or is stopped.
+      EventPattern:
+        source: [aws.glue]
+        detail-type: [Glue Job State Change]
+        detail:
+          jobName: [!Ref EtlJob]
+          state: [FAILED, TIMEOUT, STOPPED]
+      Targets:
+        - Arn: !Ref AlertTopic
+          Id: sns-alert
+
+  DataQualityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Data-quality pass rate dropped below 95% for a batch.
+      Namespace: DeliveryPipeline
+      MetricName: DQPassRate
+      Dimensions:
+        - Name: Pipeline
+          Value: !Ref EtlJob
+      Statistic: Minimum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 95
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  IngestLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Ingestion Lambda is erroring.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  DataLakeBucketName:
+    Value: !Ref DataLakeBucket
+  FirehoseStreamName:
+    Value: !Ref DeliveryEventStream
+  GlueJobName:
+    Value: !Ref EtlJob
+  RedshiftWorkgroupName:
+    Value: !Ref RedshiftWorkgroup
+  RedshiftCopyRoleArn:
+    Value: !GetAtt RedshiftCopyRole.Arn
+  RedshiftAdminSecretArn:
+    Value: !Ref RedshiftAdminSecret
+  AlertTopicArn:
+    Value: !Ref AlertTopic

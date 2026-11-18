@@ -1,0 +1,21 @@
+{
+  "total": 1109102,
+  "passed": 1096574,
+  "failed": 12528,
+  "pass_rate": 0.988704,
+  "failures_by_rule": {
+    "record_parseable": 336,
+    "event_id_present": 336,
+    "package_id_present": 2554,
+    "event_ts_valid": 3107,
+    "promised_by_valid": 336,
+    "status_valid": 336,
+    "attempt_number_in_range": 1997,
+    "weight_in_range": 2553,
+    "service_type_valid": 336,
+    "failure_reason_consistent": 1999,
+    "dsp_code_known": 1998,
+    "station_code_known": 336
+  },
+  "duplicates_removed": 11086
+}

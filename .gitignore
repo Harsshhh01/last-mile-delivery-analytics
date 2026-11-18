@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# pipeline outputs (regenerate with: python -m delivery_pipeline.run_pipeline)
+lake/
+warehouse/
+reports/
+output/
+spark-warehouse/
+metastore_db/
+derby.log
